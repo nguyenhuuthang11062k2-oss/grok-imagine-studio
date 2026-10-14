@@ -1,0 +1,24 @@
+import express from 'express';
+import multer from 'multer';
+import dotenv from 'dotenv';
+import crypto from 'node:crypto';
+import { Readable } from 'node:stream';
+dotenv.config();
+const app=express();
+const PORT=process.env.PORT||3000;
+const BASE=(process.env.NEXUS_BASE_URL||'https://api.nexusapi.co/v1').replace(/\/$/,'');
+const MODEL=process.env.VIDEO_MODEL||'grok-imagine-video-1.5';
+const KEY=process.env.NEXUS_API_KEY;
+const SITE_PASSWORD=process.env.SITE_PASSWORD;
+const jobs=new Map();
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:8*1024*1024},fileFilter:(req,file,cb)=>cb(null,['image/png','image/jpeg','image/webp'].includes(file.mimetype))});
+app.disable('x-powered-by');
+app.use(express.json({limit:'20kb'}));
+app.use(express.static('public'));
+app.use((req,res,next)=>{if(req.path==='/api/health')return next();if(!SITE_PASSWORD)return res.status(503).json({error:'SITE_PASSWORD chưa được thiết lập trên máy chủ.'});const provided=req.get('x-site-password')||'';const a=Buffer.from(provided),b=Buffer.from(SITE_PASSWORD);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(401).json({error:'Mật khẩu website không đúng.'});next()});
+app.get('/api/health',(req,res)=>res.json({ready:!!KEY&&!!SITE_PASSWORD,model:MODEL}));
+async function upstream(path,options={}){if(!KEY)throw new Error('Chưa cấu hình NEXUS_API_KEY');const response=await fetch(`${BASE}${path}`,{...options,headers:{Authorization:`Bearer ${KEY}`,...options.headers},signal:AbortSignal.timeout(90000)});const text=await response.text();let data;try{data=JSON.parse(text)}catch{data={raw:text.slice(0,500)}}if(!response.ok)throw new Error(`Nexus HTTP ${response.status}: ${JSON.stringify(data).slice(0,700)}`);return data;}
+app.post('/api/generate',upload.single('image'),async(req,res)=>{try{if(!req.file)return res.status(400).json({error:'Vui lòng chọn ảnh PNG/JPG/WebP tối đa 8 MB.'});const prompt=(req.body.prompt||'').trim();if(!prompt||prompt.length>3000)return res.status(400).json({error:'Prompt phải có từ 1 đến 3000 ký tự.'});const aspect_ratio=['9:16','16:9'].includes(req.body.aspect_ratio)?req.body.aspect_ratio:'9:16';const data=await upstream('/videos/generations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:MODEL,prompt,duration:10,resolution:'1080p',aspect_ratio,image:{url:`data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`}})});const id=data.request_id||data.id;const direct=data.video?.url||data.url;if(!id&&!direct)return res.status(502).json({error:'Nexus trả về dữ liệu không có request_id hoặc URL video.',detail:data});const localId=crypto.randomUUID();jobs.set(localId,{id,direct,created:Date.now()});res.json({job_id:localId,complete:!!direct});}catch(e){res.status(502).json({error:e.message})}});
+app.get('/api/status/:id',async(req,res)=>{try{const job=jobs.get(req.params.id);if(!job)return res.status(404).json({error:'Không tìm thấy phiên tạo video. Có thể máy chủ đã khởi động lại.'});if(Date.now()-job.created>3600000){jobs.delete(req.params.id);return res.status(410).json({error:'Phiên đã hết hạn.'})}if(job.direct)return res.json({status:'done',download_url:`/api/download/${req.params.id}`});const data=await upstream(`/videos/${encodeURIComponent(job.id)}`);const url=data.video?.url||data.url||data.output?.url;const status=data.status|| (url?'done':'pending');if(url)job.direct=url;res.json({status,download_url:url?`/api/download/${req.params.id}`:null,detail:status==='failed'?(data.error||data.message||'Video thất bại'):undefined});}catch(e){res.status(502).json({error:e.message})}});
+app.get('/api/download/:id',async(req,res)=>{try{const job=jobs.get(req.params.id);if(!job?.direct)return res.status(404).send('Video chưa sẵn sàng');const url=new URL(job.direct);if(url.protocol!=='https:')return res.status(400).send('Video URL không an toàn');const upstreamRes=await fetch(url,{signal:AbortSignal.timeout(120000)});if(!upstreamRes.ok||!upstreamRes.body)throw new Error('Không tải được video từ nhà cung cấp');res.setHeader('Content-Type','video/mp4');res.setHeader('Content-Disposition','attachment; filename="grok-video.mp4"');Readable.fromWeb(upstreamRes.body).pipe(res)}catch(e){if(!res.headersSent)res.status(502).send(e.message)}});
+app.listen(PORT,()=>console.log(`Studio listening on ${PORT}`));
